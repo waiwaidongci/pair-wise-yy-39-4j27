@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import ID_PREFIX, SPOT_CHECK_STATES, STATES
 
 
 class Repository:
@@ -24,6 +24,7 @@ class Repository:
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        spot_statuses = ",".join("'" + s.replace("'", "''") + "'" for s in SPOT_CHECK_STATES)
         with self.conn:
             self.conn.executescript(f"""
                 CREATE TABLE IF NOT EXISTS items (
@@ -65,6 +66,28 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS spot_checks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    check_no TEXT NOT NULL UNIQUE,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    description TEXT NOT NULL,
+                    reviewer TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ({spot_statuses})),
+                    item_version INTEGER NOT NULL,
+                    closed_at TEXT,
+                    closed_by TEXT,
+                    close_reason TEXT,
+                    decision_note TEXT,
+                    decided_by TEXT,
+                    decided_at TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_spot_check_open
+                    ON spot_checks(item_id) WHERE status='pending';
             """)
 
     @staticmethod
@@ -156,6 +179,123 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def create_spot_check(self, check_no: str, item_id: int, description: str,
+                          reviewer: str, item_version: int, closed_at: str,
+                          closed_by: str, close_reason: Optional[str],
+                          actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            open_row = self.conn.execute(
+                "SELECT id FROM spot_checks WHERE item_id=? AND status='pending'",
+                (item_id,),
+            ).fetchone()
+            if open_row is not None:
+                raise ConflictError("该缺陷已有未结抽检")
+            try:
+                cur = self.conn.execute(
+                    """INSERT INTO spot_checks(check_no, item_id, description, reviewer,
+                       status, item_version, closed_at, closed_by, close_reason,
+                       created_by, created_at, updated_at, version)
+                       VALUES(?,?,?,?, 'pending', ?,?,?,?,?,?,?,1)""",
+                    (check_no, item_id, description, reviewer, item_version,
+                     closed_at, closed_by, close_reason, actor, now, now),
+                )
+                check_id = int(cur.lastrowid)
+            except sqlite3.IntegrityError as exc:
+                raise ConflictError("抽检编号已存在") from exc
+        return self.get_spot_check(check_id)
+
+    def get_spot_check(self, check_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM spot_checks WHERE id=?", (check_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("抽检不存在")
+        return dict(row)
+
+    def get_open_spot_check(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM spot_checks WHERE item_id=? AND status='pending'",
+                (item_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_spot_checks(self, item_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM spot_checks"
+        params: tuple = ()
+        if item_id is not None:
+            sql += " WHERE item_id=?"
+            params = (item_id,)
+        sql += " ORDER BY id"
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def latest_transition_actor(self, item_id: int, to_status: str) -> Optional[str]:
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT actor, detail FROM audit_events
+                   WHERE entity_id=? AND action='transition' ORDER BY id""",
+                (item_id,),
+            ).fetchall()
+        for row in reversed(rows):
+            try:
+                detail = json.loads(row["detail"])
+            except (TypeError, ValueError):
+                continue
+            if detail.get("to") == to_status:
+                return row["actor"]
+        return None
+
+    def decide_spot_check(self, check_id: int, result: str, note: Optional[str],
+                          actor: str, item_version_expected: int,
+                          return_record: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """判定抽检；不通过时原子化退回维修、重计时并写入退回记录。"""
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM spot_checks WHERE id=?", (check_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("抽检不存在")
+            if row["status"] != "pending":
+                raise ConflictError("抽检已判定，不能重复判定")
+            item = self.conn.execute(
+                "SELECT * FROM items WHERE id=?", (row["item_id"],)
+            ).fetchone()
+            if item is None:
+                raise NotFoundError("项目不存在")
+            if item["version"] != item_version_expected:
+                raise ConflictError("版本冲突，请刷新后重试")
+            self.conn.execute(
+                """UPDATE spot_checks SET status=?, decision_note=?, decided_by=?,
+                   decided_at=?, updated_at=?, version=version+1 WHERE id=?""",
+                (result, note, actor, now, now, check_id),
+            )
+            new_status = item["status"]
+            new_version = item["version"]
+            if result == "failed":
+                cur = self.conn.execute(
+                    """UPDATE items SET status='repair', version=version+1, updated_at=?
+                       WHERE id=? AND version=?""",
+                    (now, item["id"], item_version_expected),
+                )
+                if cur.rowcount == 0:
+                    raise ConflictError("版本冲突，请刷新后重试")
+                if return_record is not None:
+                    self.conn.execute(
+                        """INSERT INTO records(item_id, kind, detail, status, external_ref,
+                           created_by, created_at) VALUES(?,?,?, 'closed', ?,?,?)""",
+                        (item["id"], return_record["kind"], return_record["detail"],
+                         return_record["external_ref"], actor, now),
+                    )
+                new_status = "repair"
+                new_version = item["version"] + 1
+        return {"spot_check": self.get_spot_check(check_id),
+                "item_status": new_status, "item_version": new_version}
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

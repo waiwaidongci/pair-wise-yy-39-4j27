@@ -89,11 +89,25 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"records": service.list_records(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/spot-checks"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"spot_checks": service.list_spot_checks(role, item_id)})
                 elif path.startswith("/api/items/"):
                     item_id = int(path.rsplit("/", 1)[-1])
                     actor, role = self._identity()
                     del actor
                     self._json(200, service.get_item(item_id, role))
+                elif path == "/api/spot-checks":
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"spot_checks": service.list_spot_checks(role)})
+                elif path.startswith("/api/spot-checks/"):
+                    check_id = int(path.rsplit("/", 1)[-1])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.get_spot_check(check_id, role))
                 elif path == "/api/audit":
                     actor, role = self._identity()
                     del actor
@@ -119,6 +133,12 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/spot-checks"):
+                    item_id = int(path.split("/")[3])
+                    self._json(201, service.create_spot_check(item_id, body, actor, role))
+                elif path.startswith("/api/spot-checks/") and path.endswith("/decide"):
+                    check_id = int(path.split("/")[3])
+                    self._json(200, service.decide_spot_check(check_id, body, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
