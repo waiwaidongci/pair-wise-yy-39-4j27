@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ConflictError, NotFoundError, PermissionDenied,
+                     ValidationError, ensure_role, normalize_severity,
+                     require_number, require_text)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
-                    validate_transition)
+from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES,
+                    SPOT_CHECK_CREATE_ROLES, SPOT_CHECK_JUDGE_ROLES,
+                    SPOT_CHECK_RESULTS, SPOT_CHECK_STATUSES, TITLE, VIEW_ROLES,
+                    completion_blockers, escalation_required, priority_score,
+                    response_deadline_hours, role_for_transition, validate_transition)
 
 
 class Service:
@@ -91,6 +95,80 @@ class Service:
         ensure_role(role, AUDIT_ROLES)
         return self.repository.list_audit(item_id)
 
+    def create_spot_check(self, item_id: int, payload: Dict[str, Any],
+                          actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, SPOT_CHECK_CREATE_ROLES)
+        actor = require_text(actor, "actor", 100)
+        check_no = require_text(payload.get("check_no"), "check_no", 100)
+        description = require_text(payload.get("description"), "description")
+        checker = require_text(payload.get("checker"), "checker", 100)
+        item = self.repository.get_item(item_id)
+        if item["status"] != "closed":
+            raise ConflictError("只有已关闭的缺陷才能发起抽检")
+        if self.repository.get_open_spot_check(item_id) is not None:
+            raise ConflictError("同一缺陷存在未结抽检")
+        verifier = self.repository.latest_transition_actor(item_id, "verified")
+        if verifier is not None and checker == verifier:
+            raise ValidationError("被抽检缺陷的复检人不能参加这次抽检")
+        check = self.repository.create_spot_check(
+            check_no, item_id, description, checker, item["version"],
+            verifier or "", item["version"], item["updated_at"], actor)
+        self.repository.append_audit("spot_check_create", "处置抽检", check["id"], actor, {
+            "check_no": check_no, "item_id": item_id, "checker": checker,
+            "item_version": item["version"], "closed_by": verifier,
+        })
+        return check
+
+    def judge_spot_check(self, item_id: int, payload: Dict[str, Any],
+                         actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, SPOT_CHECK_JUDGE_ROLES)
+        actor = require_text(actor, "actor", 100)
+        check_no = require_text(payload.get("check_no"), "check_no", 100)
+        result = payload.get("result")
+        if result not in SPOT_CHECK_RESULTS:
+            raise ValidationError("result必须是passed或failed")
+        note = payload.get("result_note")
+        if note is not None:
+            note = require_text(note, "result_note")
+        if result == "failed":
+            note = require_text(note, "退回维修必须填写原因")
+        expected_version = payload.get("expected_version")
+        if not isinstance(expected_version, int) or expected_version < 1:
+            raise ValidationError("expected_version必须是正整数")
+        item = self.repository.get_item(item_id)
+        check = self.repository.get_spot_check_by_no(check_no)
+        if check is None or check["item_id"] != item_id:
+            raise NotFoundError("抽检不存在")
+        if check["status"] != "pending":
+            raise ConflictError("抽检已判定，不能重复判定")
+        if actor != check["checker"]:
+            raise PermissionDenied("只有指定复检人才能判定本次抽检")
+        updated_check = self.repository.judge_spot_check(
+            check["id"], result, note, actor, expected_version)
+        detail: Dict[str, Any] = {
+            "check_no": check_no, "item_id": item_id, "result": result,
+            "from_version": expected_version, "check_version": updated_check["version"],
+        }
+        if note is not None:
+            detail["result_note"] = note
+        if result == "failed":
+            detail["from"] = item["status"]
+            detail["to"] = "repair"
+            detail["closed_version"] = check["closed_version"]
+        self.repository.append_audit("spot_check_judge", "处置抽检", check["id"], actor, detail)
+        if result == "failed":
+            self.repository.append_audit("transition", ENTITY, item_id, actor, {
+                "from": item["status"], "to": "repair",
+                "via_spot_check": check_no,
+                "escalation_required": escalation_required(
+                    item["severity"], item["quantity"], item["threshold"]),
+            })
+        return updated_check
+
+    def list_spot_checks(self, role: str, item_id: Optional[int] = None) -> list:
+        self._view(role)
+        return self.repository.list_spot_checks(item_id)
+
     @staticmethod
     def enrich(item: Dict[str, Any]) -> Dict[str, Any]:
         result = dict(item)
@@ -100,4 +178,11 @@ class Service:
             item["severity"], item["quantity"], item["threshold"])
         result["escalation_required"] = escalation_required(
             item["severity"], item["quantity"], item["threshold"])
+        returned_at = item.get("last_returned_at")
+        if item["status"] == "repair" and returned_at:
+            result["repair_restarted_at"] = returned_at
+            result["repair_deadline_at"] = (
+                datetime.fromisoformat(returned_at)
+                + timedelta(hours=result["deadline_hours"])
+            ).isoformat()
         return result

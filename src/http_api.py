@@ -84,6 +84,15 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"items": service.list_items(role)})
+                elif path == "/api/spot-checks":
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"spot_checks": service.list_spot_checks(role)})
+                elif path.startswith("/api/items/") and path.endswith("/spot-checks"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"spot_checks": service.list_spot_checks(role, item_id)})
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     actor, role = self._identity()
@@ -110,6 +119,12 @@ def make_handler(service: Service, static_dir: str):
                 body = self._body()
                 if path == "/api/items":
                     self._json(201, service.create_item(body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/spot-checks"):
+                    item_id = int(path.split("/")[3])
+                    self._json(201, service.create_spot_check(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/spot-checks/judge"):
+                    item_id = int(path.split("/")[3])
+                    self._json(200, service.judge_spot_check(item_id, body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))
